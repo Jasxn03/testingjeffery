@@ -96,30 +96,32 @@ def flow_scalars(A_series):
     return {'S_norm': S_norm, 'W_norm': W_norm, 'Q': Q, 'R_inv': R_inv}
 
 
-def flatness_kurtosis(x):
-    """
-    For a positive-definite quantity like ||tau||, compute intermittency
-    measures on the normalised fluctuations x' = x / <x> - 1.
-    This removes the trivial scaling effect so comparison across
-    aspect ratios is meaningful.
-
-    Flatness  F = <x'^4> / <x'^2>^2
-    Excess kurtosis K = F - 3
-    Also returns a non-parametric intermittency measure:
-      I = P95 / P50  (ratio of 95th to median)
-    """
-    mu = np.mean(x)
+def flatness_kurtosis(x, n_bootstrap=200):
+    mu  = np.mean(x)
     if mu < 1e-30:
-        return np.nan, np.nan, np.nan
-    xn  = x / mu - 1.0       # normalised fluctuation, zero mean by construction
+        return np.nan, np.nan, np.nan, np.nan, np.nan
+    xn  = x / mu - 1.0
     m2  = np.mean(xn**2)
     m4  = np.mean(xn**4)
     if m2 < 1e-30:
-        return np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan, np.nan, np.nan
     F = m4 / m2**2
     K = F - 3.0
     I = float(np.percentile(x, 95) / np.percentile(x, 50))
-    return float(F), float(K), float(I)
+
+    # Bootstrap std of flatness to quantify uncertainty
+    rng   = np.random.default_rng(42)
+    F_boot = []
+    for _ in range(n_bootstrap):
+        idx  = rng.integers(0, len(xn), size=len(xn))
+        xb   = xn[idx]
+        m2b  = np.mean(xb**2)
+        m4b  = np.mean(xb**4)
+        if m2b > 1e-30:
+            F_boot.append(m4b / m2b**2)
+    F_std = float(np.std(F_boot)) if F_boot else np.nan
+
+    return float(F), float(K), float(I), F_std
 
 
 def kolmogorov_time(A_series):
@@ -156,7 +158,7 @@ def compute_intermittency_vs_r(A_series, R_history, aspect_ratios, times, mu=1.0
         M, n_hat = build_transfer_matrix(axes, x_tip, mu=mu)
         tau      = fast_traction_magnitude(M, n_hat, A_series, R_r)
 
-        F, K, I = flatness_kurtosis(tau)
+        F, K, I, F_std = flatness_kurtosis(tau)
         skew = float(np.mean((tau - np.mean(tau))**3) / np.std(tau)**3)
 
         results[r] = {
@@ -164,11 +166,13 @@ def compute_intermittency_vs_r(A_series, R_history, aspect_ratios, times, mu=1.0
             'flatness': F,
             'kurtosis': K,
             'intermittency': I,
+            'flatness_std': F_std,
+            'kurtosis_std': F_std, #K = F-3 so same
             'mean':     float(np.mean(tau)),
             'std':      float(np.std(tau)),
             'skewness': skew,
         }
-        print(f"F={F:.3f}  K={K:.3f}  skew={skew:.3f}")
+        print(f"F={F:.3f}±{F_std:.3f}  K={K:.3f}  skew={skew:.3f}")
 
     return results
 
@@ -242,6 +246,8 @@ def plot_flatness_kurtosis_vs_r(results_cm, results_lw=None, tau_K=None):
     rs     = np.array(list(results_cm.keys()))
     F_cm   = np.array([results_cm[r]['flatness']      for r in rs])
     K_cm   = np.array([results_cm[r]['kurtosis']      for r in rs])
+    F_err_cm = np.array([results_cm[r]['flatness_std'] for r in rs])
+    K_err_cm = np.array([results_cm[r]['kurtosis_std'] for r in rs])
     sk_cm  = np.array([results_cm[r]['skewness']      for r in rs])
     mu_cm  = np.array([results_cm[r]['mean']          for r in rs])
     std_cm = np.array([results_cm[r]['std']           for r in rs])
@@ -262,10 +268,15 @@ def plot_flatness_kurtosis_vs_r(results_cm, results_lw=None, tau_K=None):
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
-    def _add_lw(ax, y_lw):
+    def _add_lw(ax, y_lw, yerr_lw=None):
         if results_lw is not None:
-            ax.plot(rs_lw, y_lw, 's--', color=lw_color,
-                    lw=2.5, ms=7, label='LW')
+            if yerr_lw is not None:
+                ax.errorbar(rs_lw, y_lw, yerr=yerr_lw,
+                            fmt='s--', color=lw_color,
+                            lw=2.5, ms=7, capsize=4, label='LW')
+            else:
+                ax.plot(rs_lw, y_lw, 's--', color=lw_color,
+                        lw=2.5, ms=7, label='LW')
 
     def _annotate_oblate_prolate(ax):
         """Add oblate/prolate text after ylim is set."""
@@ -276,8 +287,11 @@ def plot_flatness_kurtosis_vs_r(results_cm, results_lw=None, tau_K=None):
 
     # ── [0,0] Flatness ─────────────────────────────────────────
     ax = axes[0, 0]
-    ax.plot(rs, F_cm, 'o-', color=cm_color, lw=2.5, ms=7, label='CM')
-    _add_lw(ax, F_lw if results_lw is not None else None)
+    ax.errorbar(rs, F_cm, yerr=F_err_cm,
+            fmt='o-', color=cm_color, lw=2.5, ms=7,
+            capsize=4, label='CM')
+    _add_lw(ax, F_lw if results_lw is not None else None,
+            F_err_lw if results_lw is not None else None)
     ax.axhline(3.0, color='grey', lw=1.0, linestyle='--',
                label='Gaussian (F=3)')
     ax.axvline(1.0, color='grey', lw=0.8, linestyle=':')
@@ -292,8 +306,11 @@ def plot_flatness_kurtosis_vs_r(results_cm, results_lw=None, tau_K=None):
 
     # ── [0,1] Excess kurtosis ──────────────────────────────────
     ax = axes[0, 1]
-    ax.plot(rs, K_cm, 'o-', color=cm_color, lw=2.5, ms=7, label='CM')
-    _add_lw(ax, K_lw if results_lw is not None else None)
+    ax.errorbar(rs, K_cm, yerr=K_err_cm,
+                fmt='o-', color=cm_color, lw=2.5, ms=7,
+                capsize=4, label='CM')
+    _add_lw(ax, K_lw if results_lw is not None else None,
+            K_err_lw if results_lw is not None else None)
     ax.axhline(0.0, color='grey', lw=1.0, linestyle='--',
                label='Gaussian (K=0)')
     ax.axvline(1.0, color='grey', lw=0.8, linestyle=':')
