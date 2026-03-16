@@ -42,17 +42,19 @@ import sys
 # ─────────────────────────────────────────────────────────────
 
 CSV_PATH   = "grad_u.csv"
+LW_CSV_PATH  = "grad_u_LW.csv" 
 AXES       = [2.0, 1.0, 1.0]          # semi-axes [a, b, c]
 MU         = 1.0                       # dynamic viscosity
 BURN_IN    = 0.10                      # fraction to discard
 N_BINS     = 6                         # orientation bins for steps 2 & 4
 OUTDIR     = "ra_coupling_plots/"
 JEFFERY_PATH = "."
+ACF_MAX_LAG  = 10.0  
 
 # ── Toggle which steps to run ──────────────────────────────
-RUN_STEP1  = True
-RUN_STEP2  = True
-RUN_STEP3  = True
+RUN_STEP1  = False
+RUN_STEP2  = False
+RUN_STEP3  = False
 RUN_STEP4  = True   # slow: calls ellipsoid.sigma() at every timestep
 RUN_STEP5  = True   # slow: re-integrates orientation for each aspect ratio
 RUN_STEP6  = True   # requires RUN_STEP4 result (tau_mag) if True
@@ -1434,25 +1436,31 @@ if __name__ == '__main__':
 
     r = AXES[0] / AXES[1]
 
-    # ── Step 1 ───────────────────────────────────────────────
-    print("\n── Step 1: Orientation representations ──")
-    plot_step1_euler(times_b, R_b)
-    plot_step1_symmetry_axis(times_b, R_b)
-    plot_step1_jeffery_C(times_b, R_b, r)
+    # # ── Step 1 ───────────────────────────────────────────────
+    # print("\n── Step 1: Orientation representations ──")
+    # plot_step1_euler(times_b, R_b)
+    # plot_step1_symmetry_axis(times_b, R_b)
+    # plot_step1_jeffery_C(times_b, R_b, r)
 
-    # ── Step 2 ───────────────────────────────────────────────
-    print("\n── Step 2: Conditional flow distributions ──")
-    plot_step2_conditional(times_b, R_b, A_b, r, N_BINS)
+    # # ── Step 2 ───────────────────────────────────────────────
+    # print("\n── Step 2: Conditional flow distributions ──")
+    # plot_step2_conditional(times_b, R_b, A_b, r, N_BINS)
 
-    # ── Step 3 ───────────────────────────────────────────────
-    print("\n── Step 3: Mutual information + shuffle test ──")
-    mi_results = compute_mutual_information(R_b, A_b, n_shuffles=200)
-    plot_step3_mutual_information(mi_results)
+    # # ── Step 3 ───────────────────────────────────────────────
+    # print("\n── Step 3: Mutual information + shuffle test ──")
+    # mi_results = compute_mutual_information(R_b, A_b, n_shuffles=200)
+    # plot_step3_mutual_information(mi_results)
 
     # ── Step 4 ───────────────────────────────────────────────
     tau_mag = None
     if RUN_STEP4:
         print("\n── Step 4: Conditional traction ──")
+
+        from fast_traction import build_transfer_matrix, fast_traction_magnitude
+
+        M, n_hat = build_transfer_matrix(AXES, [AXES[0], 0., 0.], mu=MU)
+        tau_mag  = fast_traction_magnitude(M, n_hat, A_b, R_b)
+
         tau_mag = traction_magnitude(A_b, R_b, AXES, MU)
         plot_step4_conditional_traction(times_b, R_b, A_b, tau_mag, N_BINS)
     else:
@@ -1485,7 +1493,8 @@ if __name__ == '__main__':
         acf_cm = compute_step8_autocorrelations(
             times_b, A_b, R_b,
             label='CM',
-            max_lag_time=ACF_MAX_LAG
+            max_lag_time=ACF_MAX_LAG,
+            tau_mag= tau_mag
         )
  
         acf_lw = None
@@ -1494,11 +1503,17 @@ if __name__ == '__main__':
             times_lw, A_lw = load_csv(LW_CSV_PATH)
             print("  Integrating orientation ODE (LW)...")
             R_lw, _, _, _, _ = integrate_orientation(AXES, A_lw, times_lw)
-            n_burn_lw = int(len(times_lw) * BURN_IN)
+            n_burn_lw  = int(len(times_lw) * BURN_IN)
+            tau_mag_lw = None                              # ← add
+            if tau_mag is not None:                        # ← add
+                print("  Computing traction (LW)...")      # ← add
+                tau_mag_lw = traction_magnitude(           # ← add
+                    A_lw[n_burn_lw:], R_lw[n_burn_lw:], AXES, MU)  # ← add
             acf_lw = compute_step8_autocorrelations(
                 times_lw[n_burn_lw:], A_lw[n_burn_lw:], R_lw[n_burn_lw:],
                 label='LW',
-                max_lag_time=ACF_MAX_LAG
+                max_lag_time=ACF_MAX_LAG,
+                tau_mag=tau_mag_lw   # ← add this
             )
         elif LW_CSV_PATH is not None:
             print(f"  '{LW_CSV_PATH}' not found -- plotting CM only.")
