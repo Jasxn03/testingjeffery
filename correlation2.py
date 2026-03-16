@@ -1413,11 +1413,23 @@ def plot_step9_excursions(exc_cm, exc_lw=None, dt_cm=0.001,
 
 
 
+"""
+correlation.py — MAIN block rewrite with fast traction.
+
+Key changes:
+- Step 4: uses build_transfer_matrix + fast_traction_magnitude
+- Step 8 LW traction: same fast approach, reuses M since geometry identical
+- Removed duplicate slow traction_magnitude() call in step 4
+- compute_tumbling_rate_vs_r unchanged (no traction needed there)
+"""
+
 # ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+
+    from fast_traction import build_transfer_matrix, fast_traction_magnitude
 
     # ── Load ────────────────────────────────────────────────
     times, A_series = load_csv(CSV_PATH)
@@ -1428,128 +1440,156 @@ if __name__ == '__main__':
         integrate_orientation(AXES, A_series, times)
 
     # ── Burn-in ─────────────────────────────────────────────
-    n_burn        = int(len(times) * BURN_IN)
-    times_b       = times[n_burn:]
-    A_b           = A_series[n_burn:]
-    R_b           = R_history[n_burn:]
-    omega_b       = omega_history[n_burn:]
+    n_burn   = int(len(times) * BURN_IN)
+    times_b  = times[n_burn:]
+    A_b      = A_series[n_burn:]
+    R_b      = R_history[n_burn:]
+    omega_b  = omega_history[n_burn:]
 
     r = AXES[0] / AXES[1]
 
-    # # ── Step 1 ───────────────────────────────────────────────
-    # print("\n── Step 1: Orientation representations ──")
-    # plot_step1_euler(times_b, R_b)
-    # plot_step1_symmetry_axis(times_b, R_b)
-    # plot_step1_jeffery_C(times_b, R_b, r)
+    # ── Step 1 ───────────────────────────────────────────────
+    if RUN_STEP1:
+        print("\n── Step 1: Orientation representations ──")
+        plot_step1_euler(times_b, R_b)
+        plot_step1_symmetry_axis(times_b, R_b)
+        plot_step1_jeffery_C(times_b, R_b, r)
 
-    # # ── Step 2 ───────────────────────────────────────────────
-    # print("\n── Step 2: Conditional flow distributions ──")
-    # plot_step2_conditional(times_b, R_b, A_b, r, N_BINS)
+    # ── Step 2 ───────────────────────────────────────────────
+    if RUN_STEP2:
+        print("\n── Step 2: Conditional flow distributions ──")
+        plot_step2_conditional(times_b, R_b, A_b, r, N_BINS)
 
-    # # ── Step 3 ───────────────────────────────────────────────
-    # print("\n── Step 3: Mutual information + shuffle test ──")
-    # mi_results = compute_mutual_information(R_b, A_b, n_shuffles=200)
-    # plot_step3_mutual_information(mi_results)
+    # ── Step 3 ───────────────────────────────────────────────
+    if RUN_STEP3:
+        print("\n── Step 3: Mutual information + shuffle test ──")
+        mi_results = compute_mutual_information(R_b, A_b, n_shuffles=200)
+        plot_step3_mutual_information(mi_results)
 
     # ── Step 4 ───────────────────────────────────────────────
+    # Build M once for AXES geometry at tip (a,0,0).
+    # This M is valid for all steps that use the same axes and surface point.
+    # For different aspect ratios (step 5, step 12), M must be rebuilt per r
+    # because both the geometry AND the orientation history change with r.
     tau_mag = None
     if RUN_STEP4:
         print("\n── Step 4: Conditional traction ──")
+        print("  Building transfer matrix (AXES geometry, tip)...")
+        x_tip    = [AXES[0], 0., 0.]
+        M, n_hat = build_transfer_matrix(AXES, x_tip, mu=MU)
 
-        from fast_traction import build_transfer_matrix, fast_traction_magnitude
-
-        M, n_hat = build_transfer_matrix(AXES, [AXES[0], 0., 0.], mu=MU)
+        print("  Computing traction time series (fast)...")
         tau_mag  = fast_traction_magnitude(M, n_hat, A_b, R_b)
 
-        tau_mag = traction_magnitude(A_b, R_b, AXES, MU)
         plot_step4_conditional_traction(times_b, R_b, A_b, tau_mag, N_BINS)
     else:
         print("\n── Step 4: Skipped (RUN_STEP4=False) ──")
 
     # ── Step 5 — Gustavsson comparison ──────────────────────
-    print("\n── Step 5: Tumbling rate vs aspect ratio (Gustavsson comparison) ──")
-    # Aspect ratios to sweep — covers disk (r<1), sphere (r=1), rod (r>1)
-    ASPECT_RATIOS_SWEEP = [0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0]
-    tumble_results, tau_K = compute_tumbling_rate_vs_r(A_b, times_b,
-                                                        ASPECT_RATIOS_SWEEP)
-    plot_step5_gustavsson_comparison(tumble_results, tau_K, ASPECT_RATIOS_SWEEP)
+    if RUN_STEP5:
+        print("\n── Step 5: Tumbling rate vs aspect ratio (Gustavsson comparison) ──")
+        # No traction needed here — only omega from orientation integration
+        ASPECT_RATIOS_SWEEP = [0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0]
+        tumble_results, tau_K = compute_tumbling_rate_vs_r(
+            A_b, times_b, ASPECT_RATIOS_SWEEP)
+        plot_step5_gustavsson_comparison(tumble_results, tau_K, ASPECT_RATIOS_SWEEP)
+    else:
+        # Still need tau_K for later steps — compute from data directly
+        AtA   = np.einsum('tji,tjk->tik', A_b, A_b)
+        tau_K = 1.0 / np.sqrt(np.mean(np.einsum('tii->t', AtA)))
+        print(f"\n── Step 5: Skipped  (tau_K={tau_K:.4f} from data) ──")
 
     # ── Step 6 — TrO^2S diagnostic ───────────────────────────
-    print("\n── Step 6: TrO^2S vortex diagnostic ──")
-    plot_step6_TrO2S(times_b, A_b, R_b, omega_b, tau_mag)
+    if RUN_STEP6:
+        print("\n── Step 6: TrO^2S vortex diagnostic ──")
+        plot_step6_TrO2S(times_b, A_b, R_b, omega_b, tau_mag)
 
     # ── Step 7 — Vortex vs strain split ──────────────────────
-    print("\n── Step 7: Vortex vs strain split of traction and tumbling ──")
-    plot_step7_vortex_strain_split(times_b, A_b, R_b, omega_b, tau_K,
-                                   traction_mag=tau_mag,
-                                   vortex_pct=77,
-                                   window_tauK=5.0)
+    if RUN_STEP7:
+        print("\n── Step 7: Vortex vs strain split of traction and tumbling ──")
+        plot_step7_vortex_strain_split(times_b, A_b, R_b, omega_b, tau_K,
+                                       traction_mag=tau_mag,
+                                       vortex_pct=77,
+                                       window_tauK=5.0)
 
-
-    # ── Step 8 — Autocorrelation ──────────────────────
+    # ── Step 8 — Autocorrelation ─────────────────────────────
     if RUN_STEP8:
-        print("\n-- Step 8: Autocorrelation functions --")
- 
+        print("\n── Step 8: Autocorrelation functions ──")
+
         acf_cm = compute_step8_autocorrelations(
             times_b, A_b, R_b,
             label='CM',
             max_lag_time=ACF_MAX_LAG,
-            tau_mag= tau_mag
+            tau_mag=tau_mag
         )
- 
-        acf_lw = None
+
+        acf_lw     = None
+        tau_mag_lw = None
+
         if LW_CSV_PATH is not None and os.path.exists(LW_CSV_PATH):
             print(f"  Loading LW data from '{LW_CSV_PATH}'...")
             times_lw, A_lw = load_csv(LW_CSV_PATH)
+
             print("  Integrating orientation ODE (LW)...")
             R_lw, _, _, _, _ = integrate_orientation(AXES, A_lw, times_lw)
+
             n_burn_lw  = int(len(times_lw) * BURN_IN)
-            tau_mag_lw = None                              # ← add
-            if tau_mag is not None:                        # ← add
-                print("  Computing traction (LW)...")      # ← add
-                tau_mag_lw = traction_magnitude(           # ← add
-                    A_lw[n_burn_lw:], R_lw[n_burn_lw:], AXES, MU)  # ← add
+            times_lw_b = times_lw[n_burn_lw:]
+            A_lw_b     = A_lw[n_burn_lw:]
+            R_lw_b     = R_lw[n_burn_lw:]
+
+            if tau_mag is not None:
+                # M geometry is the same (same AXES, same tip point)
+                # so we reuse M and n_hat built in step 4.
+                # Only A_series and R_history differ between CM and LW.
+                print("  Computing traction (LW, fast — reusing M from step 4)...")
+                tau_mag_lw = fast_traction_magnitude(M, n_hat, A_lw_b, R_lw_b)
+
             acf_lw = compute_step8_autocorrelations(
-                times_lw[n_burn_lw:], A_lw[n_burn_lw:], R_lw[n_burn_lw:],
+                times_lw_b, A_lw_b, R_lw_b,
                 label='LW',
                 max_lag_time=ACF_MAX_LAG,
-                tau_mag=tau_mag_lw   # ← add this
+                tau_mag=tau_mag_lw
             )
         elif LW_CSV_PATH is not None:
-            print(f"  '{LW_CSV_PATH}' not found -- plotting CM only.")
+            print(f"  '{LW_CSV_PATH}' not found — plotting CM only.")
             print("  Run generate_grad_u_LW.py first to enable LW comparison.")
- 
+
         plot_step8_autocorrelations(acf_cm, acf_lw, tau_K=tau_K)
-    
+
+    # ── Step 9 — Excursion durations ─────────────────────────
     if RUN_STEP9:
-        print("\n-- Step 9: High-traction excursion durations --")
+        print("\n── Step 9: High-traction excursion durations ──")
         if tau_mag is None:
             print("  Skipping — traction not computed (set RUN_STEP4=True)")
         else:
             dt_b   = float(times_b[1] - times_b[0])
             exc_cm = compute_step9_excursions(tau_mag, dt_b, label='CM')
- 
+
             exc_lw = None
             if LW_CSV_PATH is not None and os.path.exists(LW_CSV_PATH):
-                # Reuse LW data loaded in Step 8 if available, else reload
-                try:
-                    tau_mag_lw
-                except NameError:
-                    print("  Loading LW data for Step 9...")
-                    times_lw, A_lw = load_csv(LW_CSV_PATH)
-                    R_lw, _, _, _, _ = integrate_orientation(AXES, A_lw, times_lw)
-                    n_burn_lw  = int(len(times_lw) * BURN_IN)
-                    tau_mag_lw = traction_magnitude(
-                        A_lw[n_burn_lw:], R_lw[n_burn_lw:], AXES, MU)
+                # tau_mag_lw may already be computed in step 8
+                if tau_mag_lw is None:
+                    print("  LW traction not yet computed — building now...")
+                    # Load LW if not already loaded (step 8 may have been skipped)
+                    if 'A_lw_b' not in dir():
+                        times_lw, A_lw = load_csv(LW_CSV_PATH)
+                        R_lw, _, _, _, _ = integrate_orientation(AXES, A_lw, times_lw)
+                        n_burn_lw  = int(len(times_lw) * BURN_IN)
+                        times_lw_b = times_lw[n_burn_lw:]
+                        A_lw_b     = A_lw[n_burn_lw:]
+                        R_lw_b     = R_lw[n_burn_lw:]
+                    # M already built in step 4 — reuse
+                    tau_mag_lw = fast_traction_magnitude(M, n_hat, A_lw_b, R_lw_b)
+
                 if tau_mag_lw is not None:
-                    dt_lw  = float(times_lw[1] - times_lw[0])
-                    exc_lw = compute_step9_excursions(
-                        tau_mag_lw, dt_lw, label='LW')
+                    dt_lw  = float(times_lw_b[1] - times_lw_b[0])
+                    exc_lw = compute_step9_excursions(tau_mag_lw, dt_lw, label='LW')
+
             elif LW_CSV_PATH is not None:
                 print("  LW CSV not found — plotting CM only.")
- 
-            plot_step9_excursions(exc_cm, exc_lw, dt_cm=dt_b,
-                                  tau_K=tau_K)
+
+            plot_step9_excursions(exc_cm, exc_lw, dt_cm=dt_b, tau_K=tau_K)
 
     print(f"\nAll plots saved to '{OUTDIR}'")
     print("Done.")
