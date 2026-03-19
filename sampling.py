@@ -4,10 +4,6 @@
 import pandas as pd
 import numpy as np
 
-
-import pandas as pd
-import numpy as np
-
 csv_path = 'gmm_coefficients.csv'
 
 def sample_A_tensor_batch(csv_path, n_rows=3, n_samples=1000):

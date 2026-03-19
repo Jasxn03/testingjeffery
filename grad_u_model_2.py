@@ -9,7 +9,7 @@ T = 1
 dt = 0.001
 
 noise_amp = 0.5
-steps = 200000
+steps = 1000000
 
 def drift(A, tau, T):
     expA = expm(tau*A)

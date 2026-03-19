@@ -7,7 +7,6 @@ from sklearn.mixture import GaussianMixture
 
 from load_data import load_grad_u_csv
 
-
 steps, A_timeseries = load_grad_u_csv('grad_u.csv')
 
 KDE = np.empty((3,3), dtype = object)
@@ -33,16 +32,16 @@ for i in range(3):
 
 X_VALS = np.linspace(-5, 5, 300)
 
-# fig, axes = plt.subplots(3,3, figsize=(10,10))
-# for i in range(3):
-#     for j in range(3):
-#         ax = axes[i,j]
-#         ax.plot(X_VALS, KDE[i,j](X_VALS), label='KDE')
-#         ax.plot(X_VALS, GMM[i,j], '--', label='GMM')
-#         ax.set_title(f'A[{i},{j}]')
-#         ax.legend()
-# plt.tight_layout()
-# plt.show()
+fig, axes = plt.subplots(3,3, figsize=(10,10))
+for i in range(3):
+    for j in range(3):
+        ax = axes[i,j]
+        ax.plot(X_VALS, KDE[i,j](X_VALS), label='KDE')
+        ax.plot(X_VALS, GMM[i,j], '--', label='GMM')
+        ax.set_title(f'A[{i},{j}]')
+        ax.legend()
+plt.tight_layout()
+plt.show()
 
 
 rows = []

@@ -40,7 +40,7 @@ import sys, os
 # ── adjust path if needed ─────────────────────────────────────
 JEFFERY_PATH = "."
 sys.path.insert(0, JEFFERY_PATH)
-from jeffery4 import Ellipsoid
+from jeffery4_2 import Ellipsoid
 
 
 # ─────────────────────────────────────────────────────────────
