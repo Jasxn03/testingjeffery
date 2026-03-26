@@ -91,7 +91,7 @@ N_PHI   = 60
 # Number of MC draws per GMM component for analytical PDF (Part B)
 N_ANALYTIC = 100000
 
-N_GMM_COMP = 3
+N_GMM_COMP = 6
 
 os.makedirs(DIR_SURFACE, exist_ok=True)
 os.makedirs(DIR_PDF,     exist_ok=True)
@@ -116,18 +116,32 @@ def ellipsoid_surface_grid(a, n_theta, n_phi):
 
 
 def build_stress_transfer_matrix(ellipsoid_class, a, mu, x_surface):
-    """9x9 matrix:  vec(sigma) = M @ vec(A_body)."""
+    """9x9 matrix at a single surface point:  vec(sigma) = M @ vec(A_body).
+
+    Thin wrapper around Ellipsoid.build_transfer_matrix — kept for
+    backward compatibility with Part B and named-point code.
+    """
     x   = np.array(x_surface, dtype=float)
     ell = ellipsoid_class(a, np.zeros((3, 3)), mu=mu)
     ell.use_surface_mode()
-    M   = np.zeros((9, 9))
-    for q in range(9):
-        A_basis            = np.zeros((3, 3))
-        A_basis[q//3, q%3] = 1.0
-        ell.set_strain(0.5 * (A_basis + A_basis.T))
-        ell.set_coefs()
-        M[:, q] = np.array(ell.sigma(x)).ravel()
-    return M
+    return ell.build_transfer_matrix(x)
+
+
+def build_stress_transfer_matrices_batch(ellipsoid_class, a, mu, X_surface):
+    """9x9 matrices at N surface points in one vectorised call.
+
+    Parameters
+    ----------
+    X_surface : array-like, shape (N, 3)
+
+    Returns
+    -------
+    M_grid : np.ndarray, shape (N, 9, 9)
+    """
+    X   = np.asarray(X_surface, dtype=float)
+    ell = ellipsoid_class(a, np.zeros((3, 3)), mu=mu)
+    ell.use_surface_mode()
+    return ell.build_transfer_matrices_batch(X)
 
 
 def recurrence_times(frob, t, threshold):
@@ -179,14 +193,10 @@ if THRESHOLDS:
     N_pts = len(xyz)
     print(f"  Surface grid: {N_THETA}x{N_PHI} = {N_pts} points")
 
-    # Build transfer matrix at every surface point
-    print("  Building transfer matrices (this takes a moment)...")
+    # Build transfer matrix at every surface point — single vectorised call
+    print("  Building transfer matrices (vectorised batch)...")
     t0 = time.perf_counter()
-    M_grid = np.zeros((N_pts, 9, 9))
-    for idx, x_pt in enumerate(xyz):
-        if idx % 200 == 0:
-            print(f"    {idx}/{N_pts}...", flush=True)
-        M_grid[idx] = build_stress_transfer_matrix(Ellipsoid, a, mu, x_pt)
+    M_grid = build_stress_transfer_matrices_batch(Ellipsoid, a, mu, xyz)
     print(f"  Done in {time.perf_counter()-t0:.1f}s")
 
     # Frobenius norm time series at all surface points
@@ -196,12 +206,17 @@ if THRESHOLDS:
     # M_grid: (N_pts, 9, 9),  vec_A_body.T: (9, T)
     # result: (N_pts, T, 9)  -- do in chunks to avoid OOM
     CHUNK = 200
+    M = M_grid.reshape(N_pts, 9, 9)
+    A = vec_A_body.T  # (9, T)
+
     frob_grid = np.zeros((N_pts, T))
+
     for start in range(0, N_pts, CHUNK):
-        end       = min(start + CHUNK, N_pts)
-        vs        = np.einsum('pqr,tr->ptq',
-                              M_grid[start:end].reshape(end-start, 9, 9),
-                              vec_A_body)         # (chunk, T, 9)
+        end = min(start + CHUNK, N_pts)
+
+        vs = M[start:end] @ A                  # (chunk, 9, T)
+        vs = np.transpose(vs, (0, 2, 1))      # (chunk, T, 9)
+
         frob_grid[start:end] = np.linalg.norm(vs, axis=2)
     print(f"  Done in {time.perf_counter()-t0:.2f}s")
 
@@ -290,34 +305,23 @@ Three curves per surface point:
  
 # ── Fit GMM to body-frame A (done once, shared across surface points) ──────
  
-print("  Fitting GMM to body-frame A components...")
-n_k = 3   # components — same as N_GMM_COMP for consistency
- 
-# vec_A_body: (T, 9) — already computed above from R^T A R
-mu_Ab_k  = np.zeros((n_k, 9))
-var_Ab_k = np.zeros((n_k, 9))
-w_Ab_k   = np.zeros((n_k, 9))
- 
-A_BODY_COMP_NAMES = [f"A_body_{i}{j}" for i in range(3) for j in range(3)]
- 
-for comp_idx in range(9):
-    data = vec_A_body[:, comp_idx]
-    if data.std() < 1e-10:
-        mu_Ab_k[:, comp_idx]  = data.mean()
-        var_Ab_k[:, comp_idx] = 1e-10
-        w_Ab_k[:, comp_idx]   = 1.0 / n_k
-        continue
-    gmm_ab = GaussianMixture(n_components=n_k, random_state=0)
-    gmm_ab.fit(data.reshape(-1, 1))
-    # sort by mean for consistency
-    order = np.argsort(gmm_ab.means_.ravel())
-    w_Ab_k[:, comp_idx]  = gmm_ab.weights_[order]
-    mu_Ab_k[:, comp_idx] = gmm_ab.means_.ravel()[order]
-    var_Ab_k[:, comp_idx]= gmm_ab.covariances_.ravel()[order]
- 
-w_Ab_joint = w_Ab_k.mean(axis=1)
-w_Ab_joint /= w_Ab_joint.sum()
- 
+# ── Fit full covariance GMM to body-frame A (done once) ──────────────────
+
+print("  Fitting full covariance GMM to body-frame A...")
+n_k = 3
+
+gmm_ab = GaussianMixture(
+    n_components=n_k,
+    covariance_type='full',
+    random_state=0,
+    n_init=3,
+)
+gmm_ab.fit(vec_A_body)   # (T, 9) — fit jointly, not component by component
+
+w_Ab_joint  = gmm_ab.weights_      # (n_k,)
+mu_Ab_k     = gmm_ab.means_        # (n_k, 9)
+cov_Ab_k    = gmm_ab.covariances_  # (n_k, 9, 9) — full covariance matrices
+
 # ── Load lab-frame A-GMM parameters ───────────────────────────────────────
  
 df_a         = pd.read_csv(A_GMM_CSV)
@@ -339,47 +343,31 @@ w_lab_joint = w_A_k.mean(axis=1)
 w_lab_joint /= w_lab_joint.sum()
  
  
-def analytical_frob_pdf(mu_A_components, var_A_components, w_joint,
-                         M, n_per_comp, xs):
-    """
-    Compute the analytical ||sigma||_F PDF by propagating a diagonal GMM
-    through the linear map vec(sigma) = M @ vec(A), then taking the norm.
- 
-    Parameters
-    ----------
-    mu_A_components  : (n_k, 9)  per-component means of vec(A)
-    var_A_components : (n_k, 9)  per-component variances of vec(A)
-    w_joint          : (n_k,)    mixture weights
-    M                : (9, 9)    stress transfer matrix
-    n_per_comp       : int       MC draws per component
-    xs               : (N,)      grid for PDF evaluation
- 
-    Returns
-    -------
-    pdf : (N,)  normalised PDF on xs
-    """
+def analytical_frob_pdf(mu_A_components, cov_A_components, w_joint,
+                         M, n_per_comp, xs, full_cov=False):
     n_k   = len(w_joint)
     pdf   = np.zeros_like(xs)
- 
+
     for k in range(n_k):
-        mu_s  = M @ mu_A_components[k]                        # (9,)
-        cov_s = M @ np.diag(var_A_components[k]) @ M.T        # (9,9)
- 
-        # Ensure PSD
+        mu_s  = M @ mu_A_components[k]
+        if full_cov:
+            cov_s = M @ cov_A_components[k] @ M.T
+        else:
+            cov_s = M @ np.diag(cov_A_components[k]) @ M.T
+
         eigvals = np.linalg.eigvalsh(cov_s)
         if eigvals.min() < 0:
             cov_s += np.eye(9) * (-eigvals.min() + 1e-10)
- 
+
         samples = np.random.multivariate_normal(mu_s, cov_s, size=n_per_comp)
         frob_k  = np.linalg.norm(samples, axis=1)
- 
+
         if frob_k.std() < 1e-10:
             continue
         pdf += w_joint[k] * gaussian_kde(frob_k)(xs)
- 
-    integral = np.trapz(pdf, xs)
+
+    integral = np.trapezoid(pdf, xs)
     return pdf / integral if integral > 0 else pdf
- 
  
 # ── Per named surface point ────────────────────────────────────────────────
  
@@ -410,8 +398,10 @@ for pt_idx, x_pt in enumerate(named_points):
  
     # Curve 3: body-frame GMM propagated through M  (the correct one)
     print("    Computing body-frame analytical PDF...", flush=True)
+    # new — pass full covariance matrices
     body_pdf = analytical_frob_pdf(
-        mu_Ab_k, var_Ab_k, w_Ab_joint, M, n_per_comp, xs
+        mu_Ab_k, cov_Ab_k, w_Ab_joint, M, n_per_comp, xs,
+        full_cov=True
     )
  
     # Curve 4: GMM fitted directly to empirical ||sigma||_F
@@ -420,8 +410,8 @@ for pt_idx, x_pt in enumerate(named_points):
     gmm_pdf = np.exp(gmm.score_samples(xs.reshape(-1, 1)))
  
     # L2 errors
-    l2_lab  = np.sqrt(np.trapz((emp_pdf - lab_pdf )**2, xs))
-    l2_body = np.sqrt(np.trapz((emp_pdf - body_pdf)**2, xs))
+    l2_lab  = np.sqrt(np.trapezoid((emp_pdf - lab_pdf )**2, xs))
+    l2_body = np.sqrt(np.trapezoid((emp_pdf - body_pdf)**2, xs))
     print(f"    L2 error (lab-frame  analytical): {l2_lab:.5f}")
     print(f"    L2 error (body-frame analytical): {l2_body:.5f}")
     if l2_body < l2_lab:
@@ -565,19 +555,19 @@ for pt_idx, x_pt in enumerate(named_points):
         ax.fill_between(xs_c, emp_c, alpha=0.2, color="steelblue")
         ax.plot(xs_c, emp_c, color="steelblue", lw=1.5, label="Empirical KDE")
  
-        # Analytical body-frame GMM — exact, no MC
+        # Analytical body-frame GMM
         m_row    = M[p, :]
         pred_pdf = np.zeros_like(xs_c)
         for k in range(n_k):
             mu_k  = float(m_row @ mu_Ab_k[k])
-            var_k = float(m_row @ (var_Ab_k[k] * m_row))
+            var_k = float(m_row @ cov_Ab_k[k] @ m_row)   # full covariance
             var_k = max(var_k, 1e-12)
             pred_pdf += w_Ab_joint[k] * sp_norm.pdf(xs_c, mu_k, np.sqrt(var_k))
  
         ax.plot(xs_c, pred_pdf, color="seagreen", lw=2.0, ls="--",
                 label="Body-frame GMM (analytical)")
  
-        l2 = np.sqrt(np.trapz((emp_c - pred_pdf)**2, xs_c))
+        l2 = np.sqrt(np.trapezoid((emp_c - pred_pdf)**2, xs_c))
         ax.text(0.97, 0.95, f"L2={l2:.4f}",
                 transform=ax.transAxes, ha="right", va="top", fontsize=8)
         ax.set_title(SIGMA_LABELS[i][j], fontsize=11)
@@ -626,3 +616,312 @@ if THRESHOLDS:
 print(f"  {DIR_PDF}/       -- analytical vs empirical PDF figures")
 print(f"  {PDF_GMM_CSV}    -- GMM fit to ||sigma||_F per surface point")
 print("="*55)
+
+"""
+part_c_surface_pdf_maps.py
+==========================
+PART C — Scalar summaries of p(||sigma||_F) over the full ellipsoid surface
+----------------------------------------------------------------------------
+At every (theta, phi) grid point:
+
+  1. Build the 9x9 transfer matrix M.
+  2. For each GMM component k, propagate:
+         mu_sigma_k  = M @ mu_Ab_k
+         cov_sigma_k = M @ cov_Ab_k @ M.T
+  3. Draw N_MC samples jointly from the mixture (all 9 components sampled
+     together from the SAME draw, so the stress tensor is physical).
+  4. Compute ||sigma||_F for each sample -> 1D sample set.
+  5. Extract four scalar summaries:
+         - mean
+         - std
+         - 90th percentile  (damage threshold)
+         - P(||sigma||_F > EXCEEDANCE_THRESHOLD)
+
+Plots produced
+--------------
+  part_c_2d_summaries.png   — 2x2 grid of (theta, phi) heatmaps with contours
+  part_c_3d_<qty>.png       — one 3D ellipsoid surface per scalar quantity,
+                              surface height = ellipsoid geometry,
+                              face colour AND z-offset radially scaled
+                              by the scalar field
+
+Assumptions
+-----------
+  This module is appended to / run after extra.py so the following are
+  already in scope:
+      a, mu                      ellipsoid semi-axes and viscosity
+      N_THETA, N_PHI             grid resolution (from config)
+      w_Ab_joint, mu_Ab_k,
+      cov_Ab_k, n_k              body-frame GMM parameters
+      build_stress_transfer_matrix(Ellipsoid, a, mu, x_pt)
+      Ellipsoid                  class import
+      DIR_PDF                    output directory
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+from mpl_toolkits.mplot3d import Axes3D   # noqa: F401  (needed for projection='3d')
+import os
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION  (edit these; everything else is automatic)
+# ---------------------------------------------------------------------------
+
+# MC samples drawn from the mixture at each surface point.
+# 50_000 is fast (~seconds per point on a modern CPU).
+# Raise to 200_000 for publication-quality smoothness.
+N_MC = 50_000
+
+# Exceedance threshold for P(||sigma||_F > c) map
+EXCEEDANCE_THRESHOLD = 10.0
+
+# Contour levels on the 2D heatmaps (None = auto)
+N_CONTOURS = 8
+
+# Colour maps — one per quantity for visual distinction
+CMAPS = {
+    "mean":       "viridis",
+    "std":        "plasma",
+    "p90":        "inferno",
+    "exceedance": "magma",
+}
+
+LABELS = {
+    "mean":       r"Mean  $\mathbb{E}[\|\sigma\|_F]$",
+    "std":        r"Std  $\sqrt{\mathrm{Var}[\|\sigma\|_F]}$",
+    "p90":        r"90th percentile  $F^{-1}(0.9)$",
+    "exceedance": rf"$P(\|\sigma\|_F > {EXCEEDANCE_THRESHOLD})$",
+}
+
+DIR_OUT = DIR_PDF   # reuse existing output directory
+
+# ---------------------------------------------------------------------------
+# HELPER: draw N_MC physically consistent samples from the propagated mixture
+# ---------------------------------------------------------------------------
+
+def sample_frob_mixture(M, w, mu_k, cov_k, n_samples):
+    """
+    Draw n_samples values of ||sigma||_F.
+
+    Each sample:
+      1. Pick a component index from the mixture weights (same draw for all 9
+         stress components -> physically consistent tensor).
+      2. Draw vec(sigma) ~ N(M mu_k, M cov_k M^T).
+      3. Return the Frobenius norm.
+
+    Parameters
+    ----------
+    M       : (9, 9) transfer matrix at this surface point
+    w       : (n_k,) mixture weights
+    mu_k    : (n_k, 9) component means  (body-frame A)
+    cov_k   : (n_k, 9, 9) component covariances
+    n_samples : int
+
+    Returns
+    -------
+    frob : (n_samples,) array of ||sigma||_F values
+    """
+    n_k     = len(w)
+    frob    = np.empty(n_samples)
+
+    # Pre-compute propagated parameters once per surface point
+    mu_s  = np.array([M @ mu_k[k]            for k in range(n_k)])   # (n_k, 9)
+    cov_s = np.array([M @ cov_k[k] @ M.T     for k in range(n_k)])   # (n_k, 9, 9)
+
+    # Regularise (numerical eigval issues near degenerate surface points)
+    for k in range(n_k):
+        eig_min = np.linalg.eigvalsh(cov_s[k]).min()
+        if eig_min < 0:
+            cov_s[k] += np.eye(9) * (-eig_min + 1e-10)
+
+    # Assign each sample to a component
+    comp_ids = np.random.choice(n_k, size=n_samples, p=w)
+
+    # Draw all samples — loop over components, fill relevant indices
+    for k in range(n_k):
+        idx = np.where(comp_ids == k)[0]
+        if len(idx) == 0:
+            continue
+        draws       = np.random.multivariate_normal(mu_s[k], cov_s[k],
+                                                    size=len(idx))
+        frob[idx]   = np.linalg.norm(draws, axis=1)
+
+    return frob
+
+
+# ---------------------------------------------------------------------------
+# BUILD SURFACE GRID
+# ---------------------------------------------------------------------------
+
+print("\n" + "="*60)
+print("PART C: Scalar PDF summaries over the ellipsoid surface")
+print("="*60)
+
+theta = np.linspace(0,      np.pi,   N_THETA)
+phi   = np.linspace(0, 2 * np.pi,   N_PHI)
+TH, PH = np.meshgrid(theta, phi, indexing='ij')   # (N_THETA, N_PHI)
+
+# Ellipsoid surface coordinates
+X_ell = a[0] * np.sin(TH) * np.cos(PH)
+Y_ell = a[1] * np.sin(TH) * np.sin(PH)
+Z_ell = a[2] * np.cos(TH)
+
+xyz_flat = np.stack([X_ell.ravel(), Y_ell.ravel(), Z_ell.ravel()], axis=1)
+N_pts    = len(xyz_flat)
+
+print(f"  Grid: {N_THETA}x{N_PHI} = {N_pts} surface points")
+print(f"  MC samples per point: {N_MC:,}")
+
+# ---------------------------------------------------------------------------
+# MAIN LOOP: compute scalar summaries at every surface point
+# ---------------------------------------------------------------------------
+
+field_mean  = np.zeros(N_pts)
+field_std   = np.zeros(N_pts)
+field_p90   = np.zeros(N_pts)
+field_exc   = np.zeros(N_pts)
+
+import time as _time
+
+# Pre-build all transfer matrices in one vectorised call
+print("  Building transfer matrices (vectorised batch)...")
+t0 = _time.perf_counter()
+M_all_c = build_stress_transfer_matrices_batch(Ellipsoid, a, mu, xyz_flat)
+print(f"  Transfer matrices done in {_time.perf_counter()-t0:.1f}s")
+
+# MC sampling per point (still a loop, but the Ellipsoid work is done above)
+t0 = _time.perf_counter()
+for idx in range(N_pts):
+    if idx % max(1, N_pts // 10) == 0:
+        print(f"  {idx}/{N_pts} ...", flush=True)
+
+    frob = sample_frob_mixture(M_all_c[idx], w_Ab_joint, mu_Ab_k, cov_Ab_k, N_MC)
+
+    field_mean[idx] = frob.mean()
+    field_std[idx]  = frob.std()
+    field_p90[idx]  = np.percentile(frob, 90)
+    field_exc[idx]  = (frob > EXCEEDANCE_THRESHOLD).mean()
+
+print(f"  Done in {_time.perf_counter()-t0:.1f}s")
+
+# Reshape to (N_THETA, N_PHI)
+fields = {
+    "mean":       field_mean.reshape(N_THETA, N_PHI),
+    "std":        field_std.reshape(N_THETA, N_PHI),
+    "p90":        field_p90.reshape(N_THETA, N_PHI),
+    "exceedance": field_exc.reshape(N_THETA, N_PHI),
+}
+
+# ---------------------------------------------------------------------------
+# PLOT 1 — 2D heatmaps with contour lines  (2x2 panel)
+# ---------------------------------------------------------------------------
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle(
+    r"Scalar summaries of $p(\|\sigma\|_F;\,\theta,\phi)$ over the ellipsoid surface",
+    fontsize=14,
+)
+
+theta_deg = np.degrees(theta)
+phi_deg   = np.degrees(phi)
+
+for ax, (key, F) in zip(axes.ravel(), fields.items()):
+    cmap  = CMAPS[key]
+    label = LABELS[key]
+
+    # Pcolormesh heatmap
+    im = ax.pcolormesh(phi_deg, theta_deg, F,
+                       cmap=cmap, shading='auto')
+    plt.colorbar(im, ax=ax, label=label, pad=0.02)
+
+    # Contour lines overlaid
+    cs = ax.contour(phi_deg, theta_deg, F,
+                    levels=N_CONTOURS,
+                    colors='white', linewidths=0.7, alpha=0.7)
+    ax.clabel(cs, inline=True, fontsize=7, fmt='%.2g')
+
+    ax.set_xlabel(r"$\phi$ (degrees)")
+    ax.set_ylabel(r"$\theta$ (degrees)")
+    ax.set_title(label, fontsize=11)
+
+plt.tight_layout()
+fname_2d = os.path.join(DIR_OUT, "part_c_2d_summaries.png")
+plt.savefig(fname_2d, dpi=150)
+plt.close(fig)
+print(f"\n  Saved 2D summary figure -> {fname_2d}")
+
+
+# ---------------------------------------------------------------------------
+# PLOT 2 — 3D ellipsoid surface per quantity
+#   Height  : ellipsoid geometry (true surface shape preserved)
+#   Colour  : scalar field  (same information, but readable in 2D projections)
+#   Radial offset: surface is nudged outward by a small fraction of the scalar
+#                  field so the "bumps" encode the quantity visually in 3D
+# ---------------------------------------------------------------------------
+
+def normalise_01(F):
+    """Map field to [0, 1] for radial offset scaling."""
+    lo, hi = np.nanpercentile(F, 2), np.nanpercentile(F, 98)
+    if hi == lo:
+        return np.zeros_like(F)
+    return np.clip((F - lo) / (hi - lo), 0, 1)
+
+
+RADIAL_SCALE = 0.25   # max radial offset as a fraction of the smallest semi-axis
+
+for key, F in fields.items():
+    cmap  = CMAPS[key]
+    label = LABELS[key]
+
+    # Outward unit normal on an ellipsoid surface:
+    # n_i = x_i / a_i^2,  then normalised
+    nx = X_ell / a[0]**2
+    ny = Y_ell / a[1]**2
+    nz = Z_ell / a[2]**2
+    n_mag = np.sqrt(nx**2 + ny**2 + nz**2) + 1e-15
+    nx, ny, nz = nx / n_mag, ny / n_mag, nz / n_mag
+
+    # Radial offset proportional to normalised field
+    offset = normalise_01(F) * RADIAL_SCALE * a.min()
+    Xp = X_ell + offset * nx
+    Yp = Y_ell + offset * ny
+    Zp = Z_ell + offset * nz
+
+    # Colour map
+    norm  = plt.Normalize(vmin=np.nanpercentile(F, 2),
+                          vmax=np.nanpercentile(F, 98))
+    fcolours = cm.get_cmap(cmap)(norm(F))
+
+    fig = plt.figure(figsize=(9, 7))
+    ax  = fig.add_subplot(111, projection='3d')
+
+    surf = ax.plot_surface(
+        Xp, Yp, Zp,
+        facecolors=fcolours,
+        rstride=1, cstride=1,
+        linewidth=0, antialiased=True, shade=False,
+    )
+
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, shrink=0.5, pad=0.1, label=label)
+
+    ax.set_xlabel(r"$x_1$")
+    ax.set_ylabel(r"$x_2$")
+    ax.set_zlabel(r"$x_3$")
+    ax.set_title(
+        label + "\n"
+        r"(surface height $\propto$ field; colour $=$ same field)",
+        fontsize=11,
+    )
+
+    fname_3d = os.path.join(DIR_OUT, f"part_c_3d_{key}.png")
+    plt.savefig(fname_3d, dpi=150)
+    plt.close(fig)
+    print(f"  Saved 3D figure ({key}) -> {fname_3d}")
+
+print("\nPart C complete.")
+print(f"  2D panel  : {os.path.join(DIR_OUT, 'part_c_2d_summaries.png')}")
+for key in fields:
+    print(f"  3D ({key:10s}): {os.path.join(DIR_OUT, f'part_c_3d_{key}.png')}")
