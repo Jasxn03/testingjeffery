@@ -236,7 +236,6 @@ def build_fp_matrix_2d(drift_fns, D_mat, N_basis, N_quad, a=1.0):
     return L_mat
 
 
-# ══════════════════════════════════════════════════════════════════
 # Eigenvalue solver (Bug 1 fix: sort by real part)
 # ══════════════════════════════════════════════════════════════════
 
@@ -344,6 +343,65 @@ def noise_diffusion_2d():
 
 
 # ══════════════════════════════════════════════════════════════════
+# 4D reduction: (A11, A22, A12, A13)
+#
+# Exploits two symmetries:
+#   1. Tracelessness: A33 = −A11 − A22  (removes one diagonal dof)
+#   2. Isotropy: all six off-diagonal components split into two
+#      statistically distinct classes:
+#        "row-shared"    A12 representative (shares row/col with diagonal)
+#        "pure transverse" A13 representative (neither index is diagonal)
+#      We keep one from each class; the others are set to zero.
+#
+# State vector:  x = (A11, A22, A12, A13)
+# Full matrix:
+#   A = [[ A11,  A12,  A13 ],
+#        [  0,   A22,   0  ],
+#        [  0,    0,  A33  ]]     A33 = -A11 - A22
+#
+# Component index map:
+#   0 → A11   1 → A22   2 → A12   3 → A13
+# ══════════════════════════════════════════════════════════════════
+
+def _make_A_4d(x):
+    """Reconstruct 3×3 traceless matrix from x = (A11, A22, A12, A13)."""
+    A11, A22, A12, A13 = x
+    return np.array([[A11, A12, A13],
+                     [0.0, A22, 0.0],
+                     [0.0, 0.0, -A11 - A22]])
+
+
+def drift_4d(x, Gamma):
+    """
+    4D drift vector for x = (A11, A22, A12, A13).
+    Returns (f_A11, f_A22, f_A12, f_A13).
+    """
+    dA = cm_drift(_make_A_4d(x), Gamma)
+    return np.array([dA[0, 0], dA[1, 1], dA[0, 1], dA[0, 2]])
+
+
+def noise_diffusion_4d():
+    """
+    4×4 diffusion matrix for (A11, A22, A12, A13).
+
+    From C_{ij,kl} = 2δ_ik δ_jl − ½δ_ij δ_kl − ½δ_il δ_jk,
+    the FP diffusion entry is D_{ab} = C_{ij,kl} for components a=(ij), b=(kl).
+
+    Diagonal:
+      D_A11 = C_{11,11} = 2 − ½ − ½ = 1   → ×2 = 2
+      D_A22 = C_{22,22} = 2 − ½ − ½ = 1   → ×2 = 2
+      D_A12 = C_{12,12} = 2 − 0  − 0  = 2  → ×2 = 4
+      D_A13 = C_{13,13} = 2 − 0  − 0  = 2  → ×2 = 4
+
+    Only non-zero off-diagonal among these four:
+      C_{11,22} = 0 − ½ − 0 = −½  →  D_{A11,A22} = −1
+    """
+    D = np.diag([2.0, 2.0, 4.0, 4.0])
+    D[0, 1] = D[1, 0] = -1.0
+    return D
+
+
+# ══════════════════════════════════════════════════════════════════
 # PDF reconstruction from eigenvector
 # ══════════════════════════════════════════════════════════════════
 
@@ -374,9 +432,212 @@ def reconstruct_pdf_2d(c_stat, N_basis, x_eval, a=1.0):
     return W / norm if norm > 0 else W
 
 
+def reconstruct_pdf_4d(c_stat, N_basis, x_eval, a=1.0):
+    """
+    Reconstruct the 4 marginal PDFs P(A11), P(A22), P(A12), P(A13)
+    from the stationary eigenvector of the 4D FP system.
+
+    Marginal for dimension k:
+        P_k(x) = Σ_n c_n · φ_{n_k}(x) · Π_{d≠k} [∫ φ_{n_d}(y) dy]
+
+    The integrals ∫ φ_n(y) dy are precomputed numerically.
+    """
+    N_dim = 4
+    x_int   = np.linspace(-15, 15, 4000)
+    int_phi = np.array([np.trapezoid(phi_fn(n, x_int, a), x_int)
+                        for n in range(N_basis)])       # shape (N_basis,)
+    phi_eval = np.stack([phi_fn(n, x_eval, a) for n in range(N_basis)])
+                                                        # shape (N_basis, N_eval)
+
+    basis_indices = np.array(list(np.ndindex(*([N_basis] * N_dim))),
+                             dtype=np.int32)            # (N_basis^4, 4)
+
+    marginals = {}
+    for k in range(N_dim):
+        P_k = np.zeros(len(x_eval))
+        for term_idx, n_vec in enumerate(basis_indices):
+            coeff = c_stat[term_idx]
+            if abs(coeff) < 1e-14:
+                continue
+            w = coeff
+            for d in range(N_dim):
+                if d != k:
+                    w *= int_phi[n_vec[d]]
+            P_k += w * phi_eval[n_vec[k]]
+        P_k = np.abs(P_k)
+        norm = np.trapezoid(P_k, x_eval)
+        marginals[k] = P_k / norm if norm > 0 else P_k
+
+    return marginals   # keys 0=A11, 1=A22, 2=A12, 3=A13
+
+
+def compute_4d_pdf(Gamma=0.1, N_basis=6, N_quad=20, a=0.8):
+    """
+    Compute stationary marginal PDFs for (A11, A22, A12, A13) using
+    the 4D FP Hermite expansion.
+
+    Matrix size: N_basis^4 × N_basis^4
+      N_basis=6  →   1296 ×  1296   (< 1 s)
+      N_basis=8  →   4096 ×  4096   (a few seconds)
+      N_basis=10 →  10000 × 10000   (~30 s)
+
+    Uses build_fp_matrix_2d generalised to 4D via the same GH-quadrature
+    approach but with a dedicated 4D loop.
+    """
+    D4  = noise_diffusion_4d()
+    f   = [lambda x, G=Gamma, k=k: drift_4d(x, G)[k] for k in range(4)]
+
+    N_tot = N_basis ** 4
+    print(f"  Building 4D FP matrix ({N_tot}×{N_tot})…", end=' ', flush=True)
+    t0 = time.time()
+    L  = _build_fp_matrix_4d(f, D4, N_basis, N_quad, a, Gamma)
+    print(f"done ({time.time()-t0:.1f}s)", flush=True)
+
+    vals, vecs = solve_and_sort(L)
+    lam_stat, c_stat = get_stationary_vec(vals, vecs)
+    print(f"  Stationary eigenvalue: {lam_stat:.2e}", flush=True)
+
+    x_eval    = np.linspace(-8, 8, 500)
+    marginals = reconstruct_pdf_4d(c_stat, N_basis, x_eval, a=a)
+    moments   = {k: pdf_moments_1d(x_eval, marginals[k]) for k in marginals}
+
+    return x_eval, marginals, vals, moments
+
+
+def _build_fp_matrix_4d(drift_list, D_mat, N_basis, N_quad, a, Gamma):
+    """
+    Build the (N_basis^4)² FP matrix for a 4-variable system.
+
+    FP operator:
+        L W = −∂_{x_k}[f_k W] + D_{kl} ∂²_{x_k x_l} W
+
+    Same GH-quadrature approach as build_fp_matrix_2d, extended to 4D.
+    The 4D quadrature grid has N_quad^4 points; with N_quad=20 that is
+    160,000 points — very fast (no expm inside the grid loop; instead we
+    call drift_4d once per quadrature point outside the column loop).
+    """
+    N_dim = 4
+    pts, wts = hermgauss(N_quad)
+    x = pts / a
+
+    # 1D basis on quad nodes: shape (N_basis, N_quad)
+    Phi    = np.stack([phi_fn(n,     x, a) for n in range(N_basis)])
+    Phi_p  = np.stack([phi_deriv(n,  x, a) for n in range(N_basis)])
+    Phi_pp = np.stack([phi_deriv2(n, x, a) for n in range(N_basis)])
+
+    # 4D quadrature grid: each g has shape (Nq,Nq,Nq,Nq)
+    g = np.meshgrid(*([x] * N_dim), indexing='ij')
+    t = np.meshgrid(*([pts] * N_dim), indexing='ij')
+
+    # Quadrature weight with exp correction: Π w_k · exp(Σ t_k²) / a^4
+    W4 = np.ones([N_quad] * N_dim)
+    for d in range(N_dim):
+        shape = [1] * N_dim; shape[d] = N_quad
+        W4 = W4 * wts.reshape(shape)
+    exp_corr = np.exp(sum(td**2 for td in t))
+    quad_wt  = W4 * exp_corr / a**N_dim          # shape (Nq,Nq,Nq,Nq)
+
+    # Evaluate drift and its diagonal Jacobian on the full 4D grid
+    X_flat = np.stack([gi.ravel() for gi in g], axis=1)  # (Nq^4, 4)
+    n_pts  = N_quad ** N_dim
+    F_flat  = np.zeros((n_pts, N_dim))
+    dF_flat = np.zeros((n_pts, N_dim))
+    h = 1e-5
+    for i, xv in enumerate(X_flat):
+        fv = drift_4d(xv, Gamma)
+        F_flat[i] = fv
+        for k in range(N_dim):
+            xp = xv.copy(); xm = xv.copy()
+            xp[k] += h; xm[k] -= h
+            dF_flat[i, k] = (drift_4d(xp, Gamma)[k] - drift_4d(xm, Gamma)[k]) / (2*h)
+
+    grid_shape = (N_quad,) * N_dim
+    F  = F_flat.reshape(grid_shape + (N_dim,))   # (Nq,Nq,Nq,Nq,4)
+    dF = dF_flat.reshape(grid_shape + (N_dim,))
+
+    # Precompute 1D overlap integrals (shared across all dimensions)
+    exp1d    = np.exp(pts**2)
+    w1d      = wts * exp1d / a
+    I_oo     = (Phi   * w1d) @ Phi.T     # ∫ φ_m φ_p  ≈ δ_mp
+    I_od     = (Phi   * w1d) @ Phi_p.T  # ∫ φ_m φ'_p
+    I_odd    = (Phi   * w1d) @ Phi_pp.T # ∫ φ_m φ''_p
+    I_dd     = (Phi_p * w1d) @ Phi_p.T  # ∫ φ'_m φ'_p  (cross-diff)
+
+    N_tot = N_basis ** N_dim
+    L_mat = np.zeros((N_tot, N_tot))
+
+    basis_idx = np.array(list(np.ndindex(*([N_basis]*N_dim))), dtype=np.int32)
+
+    def _basis_grid(n_vec, deriv=None):
+        """Φ_n or ∂Φ_n on the 4D grid."""
+        result = np.ones(grid_shape)
+        for d in range(N_dim):
+            nd = n_vec[d]
+            if deriv is None:
+                fac = Phi[nd]
+            elif isinstance(deriv, tuple):
+                k, l = deriv
+                fac = Phi_pp[nd] if d == k == l else \
+                      Phi_p[nd]  if d in (k, l)  else Phi[nd]
+            else:
+                fac = Phi_p[nd] if d == deriv else Phi[nd]
+            shape = [1]*N_dim; shape[d] = N_quad
+            result = result * fac.reshape(shape)
+        return result
+
+    for p_idx, p_vec in enumerate(basis_idx):
+
+        # ── Separable diffusion terms ──────────────────────────────
+        col_sep = np.zeros(N_tot)
+        for m_idx, m_vec in enumerate(basis_idx):
+            val = 0.0
+            for k in range(N_dim):
+                # Diagonal diffusion
+                Dkk = D_mat[k, k]
+                if abs(Dkk) > 1e-15:
+                    prod = Dkk * I_odd[m_vec[k], p_vec[k]]
+                    for d in range(N_dim):
+                        if d != k:
+                            prod *= I_oo[m_vec[d], p_vec[d]]
+                    val += prod
+                # Off-diagonal diffusion (D_kl + D_lk)
+                for l in range(k+1, N_dim):
+                    Dkl = D_mat[k, l] + D_mat[l, k]
+                    if abs(Dkl) < 1e-15:
+                        continue
+                    prod = Dkl * I_dd[m_vec[k], p_vec[k]] * I_dd[m_vec[l], p_vec[l]]
+                    for d in range(N_dim):
+                        if d not in (k, l):
+                            prod *= I_oo[m_vec[d], p_vec[d]]
+                    val += prod
+            col_sep[m_idx] = val
+
+        # ── Non-separable drift terms ──────────────────────────────
+        Phi_p_grid = _basis_grid(p_vec)           # Φ_p on 4D grid
+        LPhi_drift = np.zeros(grid_shape)
+        for k in range(N_dim):
+            dPhi_dxk = _basis_grid(p_vec, deriv=k)
+            LPhi_drift -= dF[..., k] * Phi_p_grid + F[..., k] * dPhi_dxk
+
+        wLPhi = quad_wt * LPhi_drift
+
+        # Project onto each row m by contracting dim-by-dim
+        col_drift = np.zeros(N_tot)
+        for m_idx, m_vec in enumerate(basis_idx):
+            acc = wLPhi.copy()
+            # Contract axes 0..3 one at a time (always contract axis 0
+            # after moving the target dimension there via tensordot)
+            for d in range(N_dim):
+                acc = np.tensordot(Phi[m_vec[d]], acc, axes=([0], [0]))
+            col_drift[m_idx] = float(acc)
+
+        L_mat[:, p_idx] = col_sep + col_drift
+
+    return L_mat
+
+
 def pdf_moments_1d(x, W):
     """Compute mean, variance, skewness, excess kurtosis from a 1D PDF."""
-    dx   = x[1] - x[0]
     mu   = np.trapezoid(x * W, x)
     mu2  = np.trapezoid((x - mu)**2 * W, x)
     mu3  = np.trapezoid((x - mu)**3 * W, x)
@@ -676,6 +937,32 @@ def plot_moments_vs_gamma(records, save_path):
     print(f"  → {save_path}")
 
 
+def plot_4d_marginals(x_eval, marginals, moments, Gamma, save_path):
+    """Plot the 4 marginal PDFs from the 4D FP solve."""
+    labels = ['$A_{11}$', '$A_{22}$', '$A_{12}$', '$A_{13}$']
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    gauss = np.exp(-x_eval**2 / 2) / math.sqrt(2 * math.pi)
+
+    for k, ax in enumerate(axes):
+        m = moments[k]
+        ax.semilogy(x_eval, marginals[k], lw=2, color=COLORS[k],
+                    label=labels[k])
+        ax.semilogy(x_eval, gauss, 'k--', lw=1.2, alpha=0.5, label='Gaussian')
+        ax.set(xlim=(-6, 6), ylim=(1e-5, 1),
+               xlabel='Component value', ylabel='PDF',
+               title=f'{labels[k]}\nskew={m["skewness"]:.3f}, '
+                     f'kurt={m["ex_kurtosis"]:.2f}')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle(fr'4D FP Marginals — $(A_{{11}}, A_{{22}}, A_{{12}}, A_{{13}})$,'
+                 fr'  $\Gamma={Gamma}$', fontsize=12, y=1.02)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  → {save_path}")
+
+
 # ══════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════
@@ -731,10 +1018,25 @@ if __name__ == '__main__':
     plot_2d(x2d, W2d, P_x1, P_x2, vals2d, m1, m2, Gamma=0.1,
             save_path=f'{OUT}/fp_2d_joint.png')
 
+    # ── Step 4: 4D — (A11, A22, A12, A13) ───────────────────────
+    print("\n[4] 4D FP: (A11, A22, A12, A13)  (Γ=0.1)")
+    x4d, marginals_4d, vals4d, moments_4d = compute_4d_pdf(
+        Gamma=0.1, N_basis=9, N_quad=20, a=0.8
+    )
+    comp_labels = ['A11', 'A22', 'A12', 'A13']
+    print(f"\n  {'Comp':>6}  {'Mean':>8}  {'Std':>8}  {'Skewness':>10}  {'Ex.Kurt':>10}")
+    for k in range(4):
+        m = moments_4d[k]
+        print(f"  {comp_labels[k]:>6}  {m['mean']:>8.4f}  {m['std']:>8.4f}"
+              f"  {m['skewness']:>10.4f}  {m['ex_kurtosis']:>10.4f}")
+    plot_4d_marginals(x4d, marginals_4d, moments_4d, Gamma=0.1,
+                      save_path=f'{OUT}/fp_4d_marginals.png')
+
     print("\n" + "=" * 70)
     print("All outputs saved to /mnt/user-data/outputs/")
-    print("  fp_convergence.png    — basis-size convergence")
-    print("  fp_multi_gamma.png    — PDFs at 4 Γ values (Fig. 2 analogue)")
+    print("  fp_convergence.png      — basis-size convergence")
+    print("  fp_multi_gamma.png      — PDFs at 4 Γ values (Fig. 2 analogue)")
     print("  fp_moments_vs_gamma.png — skewness & kurtosis vs Γ")
-    print("  fp_2d_joint.png       — joint (A11, A12) distribution")
+    print("  fp_2d_joint.png         — joint (A11, A12) distribution")
+    print("  fp_4d_marginals.png     — marginals for (A11, A22, A12, A13)")
     print("=" * 70)

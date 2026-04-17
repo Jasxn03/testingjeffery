@@ -9,7 +9,7 @@ T = 1
 dt = 0.001
 
 noise_amp = 0.5
-steps = 1000000
+steps = 5000
 
 def drift(A, tau, T):
     expA = expm(tau*A)
@@ -88,5 +88,5 @@ df = pd.DataFrame(data, columns=[
 ])
 
 # Save to CSV
-df.to_csv("grad_u.csv", index=False)
-print("Saved grad_u.csv")
+df.to_csv("grad_u2.csv", index=False)
+print("Saved grad_u2.csv")

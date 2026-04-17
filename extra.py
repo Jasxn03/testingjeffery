@@ -671,7 +671,7 @@ import os
 # MC samples drawn from the mixture at each surface point.
 # 50_000 is fast (~seconds per point on a modern CPU).
 # Raise to 200_000 for publication-quality smoothness.
-N_MC = 50_000
+N_MC = 50000
 
 # Exceedance threshold for P(||sigma||_F > c) map
 EXCEEDANCE_THRESHOLD = 10.0
@@ -682,16 +682,12 @@ N_CONTOURS = 8
 # Colour maps — one per quantity for visual distinction
 CMAPS = {
     "mean":       "viridis",
-    "std":        "plasma",
-    "p90":        "inferno",
-    "exceedance": "magma",
+    "max":        "plasma",
 }
 
 LABELS = {
     "mean":       r"Mean  $\mathbb{E}[\|\sigma\|_F]$",
-    "std":        r"Std  $\sqrt{\mathrm{Var}[\|\sigma\|_F]}$",
-    "p90":        r"90th percentile  $F^{-1}(0.9)$",
-    "exceedance": rf"$P(\|\sigma\|_F > {EXCEEDANCE_THRESHOLD})$",
+    "max":        r"Max  $\mathbb{E}[\|\sigma\|_F]$",
 }
 
 DIR_OUT = DIR_PDF   # reuse existing output directory
@@ -778,9 +774,8 @@ print(f"  MC samples per point: {N_MC:,}")
 # ---------------------------------------------------------------------------
 
 field_mean  = np.zeros(N_pts)
-field_std   = np.zeros(N_pts)
-field_p90   = np.zeros(N_pts)
-field_exc   = np.zeros(N_pts)
+field_max   = np.zeros(N_pts)
+
 
 import time as _time
 
@@ -799,25 +794,21 @@ for idx in range(N_pts):
     frob = sample_frob_mixture(M_all_c[idx], w_Ab_joint, mu_Ab_k, cov_Ab_k, N_MC)
 
     field_mean[idx] = frob.mean()
-    field_std[idx]  = frob.std()
-    field_p90[idx]  = np.percentile(frob, 90)
-    field_exc[idx]  = (frob > EXCEEDANCE_THRESHOLD).mean()
+    field_max[idx]  = np.max(frob)
 
 print(f"  Done in {_time.perf_counter()-t0:.1f}s")
 
 # Reshape to (N_THETA, N_PHI)
 fields = {
     "mean":       field_mean.reshape(N_THETA, N_PHI),
-    "std":        field_std.reshape(N_THETA, N_PHI),
-    "p90":        field_p90.reshape(N_THETA, N_PHI),
-    "exceedance": field_exc.reshape(N_THETA, N_PHI),
+    "max":        field_max.reshape(N_THETA, N_PHI),
 }
 
 # ---------------------------------------------------------------------------
 # PLOT 1 — 2D heatmaps with contour lines  (2x2 panel)
 # ---------------------------------------------------------------------------
 
-fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig, axes = plt.subplots(1, 2, figsize=(14, 10))
 fig.suptitle(
     r"Scalar summaries of $p(\|\sigma\|_F;\,\theta,\phi)$ over the ellipsoid surface",
     fontsize=14,

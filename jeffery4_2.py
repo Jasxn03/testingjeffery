@@ -1,3 +1,5 @@
+import os
+os.environ.setdefault("JAX_PLATFORMS", "cpu") 
 from scipy.integrate import quad
 from scipy.optimize import brentq, root_scalar
 import numpy as np

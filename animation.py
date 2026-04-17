@@ -74,7 +74,7 @@ def compute_frobenius_norms(M_grid, vec_A_body, steps, print_every=1000, batch_s
 vec_A_body = vec_A_lab.copy()
 
 print("Precomputing stress norms...")
-frob_all = compute_frobenius_norms(M_grid, vec_A_body, steps, print_every=1000)
+frob_all = compute_frobenius_norms(M_grid, vec_A_body, steps, print_every=1000) #vec_A_lab instead?
 print("Finished stress norms.")
 
 # -------------------------
@@ -191,9 +191,19 @@ def plot_rotating_ellipsoid_with_stress(
             wire_artists[j].append(ln)
 
     # Surface scatter points
+    # Surface scatter points — initialize WITH data so vmin/vmax and array size are set
     scatters = []
+    sp_init = sp @ np.eye(3)  # identity rotation at t=0
     for j, ax in enumerate(axes):
-        sc = ax.scatter([], [], c=[], s=20, cmap='inferno', vmin=np.min(stress_norms), vmax=np.max(stress_norms))
+        px0, py0 = _project(sp_init, planes[j])
+        sc = ax.scatter(
+            px0, py0,
+            c=stress_norms[0],       # ← initialize with actual data, not []
+            s=20,
+            cmap='inferno',
+            vmin=np.percentile(stress_norms, 2),   # ← robust colormap limits
+            vmax=np.percentile(stress_norms, 98)
+        )
         scatters.append(sc)
 
     # Function to update each frame
